@@ -10,34 +10,6 @@
 
 #include "../pipeline.h"
 
-void testAtomicFlag()
-{
-	std::atomic_flag f{ATOMIC_FLAG_INIT};
-	std::cout << "f 1: " << f.test_and_set() << std::endl;
-	std::cout << "f 2: " << f.test_and_set() << std::endl;
-	std::cout << "f 3: " << f.test_and_set() << std::endl;
-
-	f.clear();
-	std::cout << "f 10: " << f.test_and_set() << std::endl;
-	std::cout << "f 20: " << f.test_and_set() << std::endl;
-	std::cout << "f 30: " << f.test_and_set() << std::endl;
-}
-
-void testCompareExchange()
-{
-	std::atomic<bool> atomicVar{true}; 
-
-	bool expected{false};
-	{
-		auto res{atomicVar.compare_exchange_weak(expected, true)};
-		std::cout << "compare_exchange_weak: res: " << res << ", expected: " << expected << ", atomicVar: " << atomicVar.load() << std::endl;
-	}
-	{
-		auto res{atomicVar.compare_exchange_weak(expected, true)};
-		std::cout << "compare_exchange_weak: res: " << res << ", expected: " << expected << ", atomicVar: " << atomicVar.load() << std::endl;
-	}
-}
-
 
 template <typename data_t, typename flags_t>
 struct DataNode
@@ -290,7 +262,7 @@ void testPipeline()
 	};
 
 	//auto waistTime{[](){ double res{0}; for (int i = 0 ; i < 0; ++i){res += sqrt(static_cast<double>(i * i * i) / 100.0);} return res;}};
-	auto waistTime{[](){ std::this_thread::sleep_for(std::chrono::microseconds{10});}};
+	auto waistTime{[](){ std::this_thread::sleep_for(std::chrono::microseconds{5});}};
 	//auto waistTime{[](){ }};
 	auto producerTask{[](DataToProcess& data_){ data_ = DataToProcess{};}};
 	auto processorTask1{[&waistTime](DataToProcess& data_){data_._results.emplace_back("task1 worked"); waistTime();}};
@@ -337,7 +309,7 @@ void testPipeline()
 	pl.addProcessor(processorTask3);
 	pl.addFinalizer(finalizerTask);
 
-	size_t secondsToWait{10};
+	size_t secondsToWait{5};
 
 	std::cout << "start pipeline for : " << secondsToWait << " seconds" << std::endl;
 	int repeat{10};

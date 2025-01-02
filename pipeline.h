@@ -5,6 +5,9 @@
 #include <vector>
 #include <functional>
 #include <limits>
+#include <thread>
+#include <unistd.h>
+#include <cstring>
 
 /*
     will create a thread for each added task, they will be executed in the same order.
@@ -17,9 +20,9 @@ class pipeLine final
     public:
     ~pipeLine() { stop(); }
 
-    void addProducer(std::function<void(T&)>);
-    void addProcessor(std::function<void(T&)>);
-    void addFinalizer(std::function<void(T&)>);
+    void addProducer(std::function<void(T&)>, int core = -1);
+    void addProcessor(std::function<void(T&)>, int core = -1);
+    void addFinalizer(std::function<void(T&)>, int core = -1);
 
     void start();
     void stop();
@@ -28,50 +31,72 @@ class pipeLine final
     void verifyNoUnfinishedTasks();
     
     static constexpr int flagIdleVal() { return 0; }
-    struct Node
+    struct DataNode
     {
         std::atomic<int> _flags{flagIdleVal()};
         T _data;
     };
 
-    std::array<Node, Len> _ringBuffer;
+    std::array<DataNode, Len> _ringBuffer;
     std::vector<std::thread> _threads;
     
     std::atomic<bool> _endProducing{false};
     std::atomic<bool> _endProcessing{false};
 
-    std::vector<std::function<void(T&)>> _tasks;
+    struct TaskNode
+    {
+        TaskNode(std::function<void(T&)> task, int core): _task{std::move(task)}, _core{core} {}
+
+        std::function<void(T&)> _task;
+        int _core{-1};
+    };
+
+    std::vector<TaskNode> _tasks;
     size_t _limitNumOfTasks{std::numeric_limits<unsigned char>::max()};
 };
 
 
+inline void pinThreadOnCore(int core)
+{
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    if (rc != 0)
+    {
+        const auto localErrno{errno};
+        std::cerr << "Failed to pin core: " << core << ", rc: " << rc << ", errno: " << std::strerror(localErrno) << std::endl;
+    }
+}
+
+
 template<size_t Len, typename T>
-void pipeLine<Len, T>::addProducer(std::function<void(T&)> func_)
+void pipeLine<Len, T>::addProducer(std::function<void(T&)> func_, int core)
 {
     if (_tasks.size() != 0)
     {
         throw std::runtime_error{"producer must be first"};
     }
-    _tasks.emplace_back(std::move(func_));
+    _tasks.emplace_back(std::move(func_), core);
 }
 template<size_t Len, typename T>
-void pipeLine<Len, T>::addProcessor(std::function<void(T&)> func_)
+void pipeLine<Len, T>::addProcessor(std::function<void(T&)> func_, int core)
 {
     if (_limitNumOfTasks <= _tasks.size())
     {
-        throw std::runtime_error{"fincalizer was already added, can't add more processors"};
+        throw std::runtime_error{"finalizer was already added, can't add more processors"};
     }
-    _tasks.emplace_back(std::move(func_));
+    _tasks.emplace_back(std::move(func_), core);
 }
 
 template<size_t Len, typename T>
-void pipeLine<Len, T>::addFinalizer(std::function<void(T&)> func_)
+void pipeLine<Len, T>::addFinalizer(std::function<void(T&)> func_, int core)
 {
     if (_limitNumOfTasks <= _tasks.size())
     {
-        throw std::runtime_error{"fincalizer was already added, can't add more finalizers"};
+        throw std::runtime_error{"finalizer was already added, can't another finalizer"};
     }
-    _tasks.emplace_back(std::move(func_));
+    _tasks.emplace_back(std::move(func_), core);
     _limitNumOfTasks = _tasks.size();
 }
 
@@ -83,7 +108,13 @@ void pipeLine<Len, T>::start()
         throw std::runtime_error{"must have at least 2 tasks - producer, (optional N processors) and finalizer"};
     }
 
-    auto dataProducerTask{[this](int waitFlag_, int startFlag_, int endFlag_, std::function<void(T&)> proc_){
+    auto dataProducerTask{[this](int waitFlag_, int startFlag_, int endFlag_, TaskNode taskNode_){
+
+        if (taskNode_._core > -1)
+        {
+            pinThreadOnCore(taskNode_._core);
+        }
+
 		size_t index{0};
 		while(!this->_endProducing.load(std::memory_order_acquire))
 		{
@@ -98,7 +129,7 @@ void pipeLine<Len, T>::start()
 				if(this->_endProducing.load(std::memory_order_acquire)) { return; }
 			}
 
-			proc_(current._data);
+			taskNode_._task(current._data);
 			current._flags.store(endFlag_, std::memory_order_release);
 		}
 	}};
@@ -112,8 +143,13 @@ void pipeLine<Len, T>::start()
     _threads.emplace_back(dataProducerTask, waitFlag, startFlag, endFlag, *iterProducer);
     waitFlag = endFlag;
 
+    auto dataProcessorTask{[this](int waitFlag_, int startFlag_, int endFlag_, TaskNode taskNode_){
 
-    auto dataProcessorTask{[this](int waitFlag_, int startFlag_, int endFlag_, std::function<void(T&)> proc_){
+        if (taskNode_._core > -1)
+        {
+            pinThreadOnCore(taskNode_._core);
+        }
+
 		size_t index{0};
 		while(!this->_endProcessing.load(std::memory_order_acquire))
 		{
@@ -132,7 +168,7 @@ void pipeLine<Len, T>::start()
 
 			if (exitLoop) { break; }
 
-			proc_(current._data);
+			taskNode_._task(current._data);
 			current._flags.store(endFlag_, std::memory_order_release);
             ++index;
 		}
@@ -160,7 +196,7 @@ void pipeLine<Len, T>::start()
 
             if (exitLoop) { break; }
 
-			proc_(current._data);
+			taskNode_._task(current._data);
 			current._flags.store(endFlag_, std::memory_order_release);
 		}
 
